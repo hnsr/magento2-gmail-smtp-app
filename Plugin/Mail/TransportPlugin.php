@@ -7,7 +7,10 @@
 
 namespace MagePal\GmailSmtpApp\Plugin\Mail;
 
-class TransportPlugin extends \Zend_Mail_Transport_Smtp
+use Zend\Mail\Message;
+use Zend\Mail\Transport\SmtpOptions;
+
+class TransportPlugin
 {
     /**
      * @var \MagePal\GmailSmtpApp\Helper\Data
@@ -20,14 +23,21 @@ class TransportPlugin extends \Zend_Mail_Transport_Smtp
     protected $storeModel;
 
     /**
+     * @var \Zend\Mail\Transport\Smtp
+     */
+    private $smtpTransport;
+
+    /**
      * @param \MagePal\GmailSmtpApp\Helper\Data $dataHelper
      */
     public function __construct(
         \MagePal\GmailSmtpApp\Helper\Data $dataHelper,
-        \MagePal\GmailSmtpApp\Model\Store $storeModel
+        \MagePal\GmailSmtpApp\Model\Store $storeModel,
+        \Zend\Mail\Transport\Smtp $smtpTransport
     ) {
         $this->dataHelper = $dataHelper;
         $this->storeModel = $storeModel;
+        $this->smtpTransport = $smtpTransport;
     }
 
     /**
@@ -39,7 +49,8 @@ class TransportPlugin extends \Zend_Mail_Transport_Smtp
     public function aroundSendMessage(
         \Magento\Framework\Mail\TransportInterface $subject,
         \Closure $proceed
-    ) {
+    ): void
+    {
         if ($this->dataHelper->isActive()) {
             if (method_exists($subject, 'getStoreId')) {
                 $this->storeModel->setStoreId($subject->getStoreId());
@@ -57,16 +68,15 @@ class TransportPlugin extends \Zend_Mail_Transport_Smtp
      * @throws \Magento\Framework\Exception\MailException
      * @throws \Zend_Mail_Exception
      */
-    public function sendSmtpMessage(\Magento\Framework\Mail\MessageInterface $message)
+    public function sendSmtpMessage(\Magento\Framework\Mail\MessageInterface $message): void
     {
         $dataHelper = $this->dataHelper;
         $dataHelper->setStoreId($this->storeModel->getStoreId());
 
-        if ($message instanceof \Zend_mail) {
-            if ($message->getDate() === null) {
-                $message->setDate();
-            }
-        }
+        // This is less than ideal, but we must eventually get a Zend message if we want to use its smtp transport.
+        // See \Magento\Framework\Mail\Transport::sendMessage() where this is also done.
+        /** @var Message $message */
+        $message = Message::fromString($message->getRawMessage());
 
         //Set reply-to path
         $setReturnPath = $dataHelper->getConfigSetReturnPath();
@@ -83,7 +93,7 @@ class TransportPlugin extends \Zend_Mail_Transport_Smtp
         }
 
         if ($returnPathEmail !== null && $dataHelper->getConfigSetReturnPath()) {
-            $message->setReturnPath($returnPathEmail);
+            $message->getHeaders()->addHeaderLine('Return-Path', $returnPathEmail);
         }
 
         if ($message->getReplyTo() === null && $dataHelper->getConfigSetReplyTo()) {
@@ -91,54 +101,43 @@ class TransportPlugin extends \Zend_Mail_Transport_Smtp
         }
 
         if ($returnPathEmail !== null && $dataHelper->getConfigSetFrom()) {
-            $message->clearFrom();
+            $message->getHeaders()->removeHeader('From');
             $message->setFrom($returnPathEmail);
         }
 
-        //set config
+        $this->setConnectionOptions();
+
+        try {
+            $this->smtpTransport->send($message);
+        } catch (\Exception $e) {
+            throw new \Magento\Framework\Exception\MailException(new \Magento\Framework\Phrase($e->getMessage()), $e);
+        }
+    }
+
+    protected function setConnectionOptions()
+    {
+        $dataHelper = $this->dataHelper;
+
         $smtpConf = [
             'name' => $dataHelper->getConfigName(),
             'port' => $dataHelper->getConfigSmtpPort(),
         ];
 
         $auth = strtolower($dataHelper->getConfigAuth());
-        if ($auth != 'none') {
-            $smtpConf['auth'] = $auth;
-            $smtpConf['username'] = $dataHelper->getConfigUsername();
-            $smtpConf['password'] = $dataHelper->getConfigPassword();
+        if ($auth !== 'none') {
+            $smtpConf['connection_class'] = $auth === 'cram-md5' ? 'crammd5' : $auth;
+            $smtpConf['connection_config'] = [
+                'username' => $dataHelper->getConfigUsername(),
+                'password' => $dataHelper->getConfigPassword(),
+            ];
         }
 
         $ssl = $dataHelper->getConfigSsl();
-        if ($ssl != 'none') {
-            $smtpConf['ssl'] = $ssl;
+        if ($ssl !== 'none') {
+            $smtpConf['connection_config']['ssl'] = $ssl;
         }
-        $smtpHost = $dataHelper->getConfigSmtpHost();
-        $this->initialize($smtpHost, $smtpConf);
+        $smtpConf['host'] = $dataHelper->getConfigSmtpHost();
 
-        try {
-            parent::send($message);
-        } catch (\Exception $e) {
-            throw new \Magento\Framework\Exception\MailException(new \Magento\Framework\Phrase($e->getMessage()), $e);
-        }
-    }
-
-    /**
-     * @param string $host
-     * @param array $config
-     */
-    public function initialize($host = '127.0.0.1', array $config = [])
-    {
-        if (isset($config['name'])) {
-            $this->_name = $config['name'];
-        }
-        if (isset($config['port'])) {
-            $this->_port = $config['port'];
-        }
-        if (isset($config['auth'])) {
-            $this->_auth = $config['auth'];
-        }
-
-        $this->_host = $host;
-        $this->_config = $config;
+        $this->smtpTransport->setOptions(new SmtpOptions($smtpConf));
     }
 }
